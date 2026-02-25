@@ -2,5 +2,7 @@ plotly
 pandas
 numpy
 scikit-learn
-pytorch
 tqdm
+yfinance
+torch
+torchvision
