@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import os
+from tqdm import tqdm
 
 
 def fetch_data(ticker, period, interval):
@@ -119,6 +120,27 @@ class LSTMModel(nn.Module):
         return x
 
 
+class EarlyStopping:
+    """
+    Simple early stopping for training based on loss improvement.
+    """
+    def __init__(self, patience=3, min_delta=1e-4):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss = None
+        self.counter = 0
+        self.should_stop = False
+
+    def step(self, loss):
+        if self.best_loss is None or loss < self.best_loss - self.min_delta:
+            self.best_loss = loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+
+
 def build_or_load_model(time_steps):
     """
     Define and compile the LSTM model or load a pre-existing one.
@@ -133,7 +155,8 @@ def build_or_load_model(time_steps):
     nn.Module
         The PyTorch LSTM model.
     """
-    model_path = 'lstm_model.pth'
+    model_dir = 'models'
+    model_path = os.path.join(model_dir, 'lstm_model.pth')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     try:
@@ -169,16 +192,21 @@ def run_dynamic_training_loop():
     """
     # Define Constants
     TICKER = "AAPL"
-    PERIOD = "60d"
+    PERIOD = "15d"
     INTERVAL = "15m"
-    TIME_STEPS = 60
-    TRAINING_INTERVAL_SECONDS = 3600  # 1 hour between training cycles
+    TIME_STEPS = 180
+    TRAINING_INTERVAL_SECONDS = 30  # 1 minute between training cycles
     
     # Initial Setup
     model, device = build_or_load_model(TIME_STEPS)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
+    # Fetch full historical data once at the start
+    print(f"Fetching initial full dataset for {TICKER}...")
+    accumulated_data = fetch_data(TICKER, PERIOD, INTERVAL)
+    print(f"Initial dataset size: {len(accumulated_data)} rows\n")
+
     # Infinite Loop
     cycle = 0
     while True:
@@ -188,40 +216,72 @@ def run_dynamic_training_loop():
         print(f"{'='*60}\n")
         
         try:
-            # Fetch the latest data
-            data = fetch_data(TICKER, PERIOD, INTERVAL)
-            
-            # Preprocess the data
-            X_train, y_train, scaler = preprocess_data(data, TIME_STEPS)
+            if cycle > 1:
+                # Fetch fresh data and append only new rows to accumulated dataset
+                print(f"Fetching fresh data for incremental update...")
+                fresh_data = fetch_data(TICKER, PERIOD, INTERVAL)
+                try:
+                    last_idx = accumulated_data.index[-1]
+                    new_rows = fresh_data[fresh_data.index > last_idx]
+                except Exception:
+                    new_rows = fresh_data[~fresh_data.index.isin(accumulated_data.index)]
+
+                if not new_rows.empty:
+                    accumulated_data = pd.concat([accumulated_data, new_rows])
+                    print(f"Appended {len(new_rows)} new row(s). Total dataset size: {len(accumulated_data)} rows.")
+                else:
+                    print(f"No new rows in fresh data. Using accumulated dataset ({len(accumulated_data)} rows).")
+            else:
+                print(f"Cycle 1: Using initial accumulated dataset with {len(accumulated_data)} rows.")
+
+            # Preprocess the accumulated data
+            X_train, y_train, scaler = preprocess_data(accumulated_data, TIME_STEPS)
             
             # Convert to PyTorch tensors
             X_train_tensor = torch.FloatTensor(X_train).to(device)
             y_train_tensor = torch.FloatTensor(y_train).reshape(-1, 1).to(device)
             
-            # Train the model with incremental learning
+            # Train the model with incremental learning using tqdm and early stopping
             print(f"Training model on {len(X_train)} samples...")
             model.train()
-            
-            for epoch in range(2):
-                # Mini-batch training
-                batch_size = 32
+
+            max_epochs = 100
+            batch_size = 32
+            early_stopper = EarlyStopping(patience=10, min_delta=1e-4)
+            pbar = tqdm(range(1, max_epochs + 1), desc="Epochs")
+            for epoch in pbar:
+                epoch_loss = 0.0
+                num_batches = 0
+
                 for i in range(0, len(X_train_tensor), batch_size):
                     batch_X = X_train_tensor[i:i+batch_size]
                     batch_y = y_train_tensor[i:i+batch_size]
-                    
+
                     # Forward pass
                     outputs = model(batch_X)
                     loss = criterion(outputs, batch_y)
-                    
+
                     # Backward pass and optimization
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
-                
-                print(f"Epoch {epoch+1}/2 - Loss: {loss.item():.6f}")
-            
-            # Save the updated model
-            model_path = 'lstm_model.pth'
+
+                    epoch_loss += loss.item()
+                    num_batches += 1
+
+                avg_loss = epoch_loss / num_batches if num_batches else epoch_loss
+                pbar.set_postfix({'loss': f"{avg_loss:.6f}"})
+
+                # Early stopping check
+                early_stopper.step(avg_loss)
+                if early_stopper.should_stop:
+                    pbar.set_description(f"Epochs (early stopped at {epoch})")
+                    break
+
+            # Save the updated model into the models/ directory
+            model_dir = 'models'
+            os.makedirs(model_dir, exist_ok=True)
+            model_path = os.path.join(model_dir, f'lstm_model_{cycle}.pth')
             torch.save(model.state_dict(), model_path)
             print(f"Model saved to {model_path}")
             
@@ -229,7 +289,7 @@ def run_dynamic_training_loop():
             print("\nMaking prediction for the next price...")
             model.eval()
             with torch.no_grad():
-                last_sequence = data['Close'].values[-TIME_STEPS:].reshape(-1, 1)
+                last_sequence = accumulated_data['Close'].values[-TIME_STEPS:].reshape(-1, 1)
                 last_sequence_scaled = scaler.transform(last_sequence)
                 last_sequence_scaled = torch.FloatTensor(last_sequence_scaled).reshape(1, TIME_STEPS, 1).to(device)
                 
@@ -239,8 +299,26 @@ def run_dynamic_training_loop():
                 # Inverse transform to get the actual price
                 next_price = scaler.inverse_transform(next_price_scaled)
             
-            current_price = data['Close'].iloc[-1]
-            predicted_price = next_price[0, 0]
+            # Ensure we have plain Python floats for printing/percentage calculations
+            def _safe_last_value(close_like):
+                # handle pandas Series, numpy arrays (1D or 2D), and lists
+                try:
+                    # pandas Series or similar
+                    return float(close_like.iloc[-1])
+                except (AttributeError, TypeError):
+                    arr = np.asarray(close_like)
+                    if arr.ndim == 0:
+                        return float(arr.item())
+                    elif arr.ndim == 1:
+                        return float(arr[-1])
+                    elif arr.ndim == 2 and arr.shape[1] == 1:
+                        return float(arr[-1, 0])
+                    else:
+                        # flatten fallback
+                        return float(arr.reshape(-1)[-1])
+
+            current_price = _safe_last_value(accumulated_data['Close'])
+            predicted_price = float(next_price[0, 0])
             price_change = predicted_price - current_price
             price_change_pct = (price_change / current_price) * 100
             
