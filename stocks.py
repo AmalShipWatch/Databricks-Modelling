@@ -10,6 +10,8 @@ import time
 import os
 from datetime import datetime
 from tqdm import tqdm
+import mlflow
+from mlflow import MlflowClient
 
 # --- TUNED CONFIGURATION ---
 TICKER = "BTC-USD"
@@ -91,7 +93,7 @@ def evaluate_model(model, X_test, y_test, scaler, scaled_data, time_steps):
     mse = mean_squared_error(y_test_np, predictions)
     mae = mean_absolute_error(y_test_np, predictions)
     r2 = r2_score(y_test_np, predictions)
-    
+    rmse = np.sqrt(mse)
     # Inverse transform to get actual prices
     pred_prices = scaler.inverse_transform(predictions)
     actual_prices = scaler.inverse_transform(y_test_np)
@@ -104,11 +106,12 @@ def evaluate_model(model, X_test, y_test, scaler, scaled_data, time_steps):
         'mae': mae,
         'r2': r2,
         'price_mae': price_mae,
+        'rmse': rmse,
         'predictions': predictions,
         'actual': y_test_np
     }
     
-    return metrics
+    return metrics, y_test_np
 
 def save_model(model, cycle_num, models_dir="models"):
     """
@@ -122,6 +125,72 @@ def save_model(model, cycle_num, models_dir="models"):
     
     torch.save(model.state_dict(), filename)
     print(f"Model saved: {filename}")
+
+def log_model_mlflow(model, cycle_num, metrics, X_train=None, y_train=None, X_test=None, y_test=None, pred_scaled=None):
+    """
+    Logs model and metrics to MLflow.
+    """
+    
+    evaluation_data = X_test.copy()
+
+    mlflow.set_experiment('/Users/amalmuhammed6677@gmail.com/bitcoin_forecast')
+    with mlflow.start_run() as run:
+        feature_map = {
+            name: param.detach().cpu().numpy()
+            for name, param in model.named_parameters()
+        }
+
+        signature = infer_signature(X_train, pred_scaled)
+        mlflow.log_params(feture_map)
+
+        model_info = mlflow.pytorch.log_model(
+            model,
+            "bitcoin_model",
+            signature=signature,
+            input_example=X_train,
+            registered_model_name="workspace.default.BitcoinForecast",
+            metadata={"cycle": cycle_num}
+        )
+        mlflow.log_metrics(metrics)
+
+        mlflow.log_model(
+            model,
+            name = "bitcoin_model",
+            input_example=X_train.iloc[[0]],
+            targets = ytest.iloc[[0]],
+            model_format="pth",
+            registered_model_name="workspace.default.BitcoinForecast",
+            metadata={"cycle": cycle_num}
+        )
+
+        mlflow.models.evaluate(
+            model_info.model_uri,
+            data = evaluation_data,
+            targets=y_test,
+            profile="regression",
+            model_type="regressor",
+            eval_name=f"cycle_{cycle_num}",
+            evaluator_config={"metric_prefix": "mlflow_evaluation_"},
+        )
+
+        print(f"Model logged: {model_info.model_uri}")
+        print(f"RMSE: {metrics{"rmse"}:.2f}")
+        print(f"Price MAE: {metrics{"price_mae"}:.2f}")
+
+    client = MlflowClient()
+    client.set_registered_model_alias("BitcoinForecast", "best", cycle_num)
+
+def deployment_validation(X_train = None, X_test = None):
+    """
+    Validates the model using the MLflow API.
+    """
+    model_uri = "models:/workspace.default.BitcoinForecast@best"
+    mlflow.models.predict(model_uri, X_train, env_manager = "uv")
+
+    loaded_registered_model = mlflow.pyfunc.load_model(model_uri=model_uri)
+    loaded_registered_model.predict(X_train)
+
+
 
 def train_model(model, X_data, y_data, criterion, optimizer, training_type="initial"):
     """
@@ -173,10 +242,11 @@ def main():
     train_model(model, X_train, y_train, criterion, optimizer, training_type="initial")
     
     # Evaluate initial model
-    metrics = evaluate_model(model, X_train, y_train, scaler, X_train.cpu().numpy(), TIME_STEPS)
+    metrics, y_pred = evaluate_model(model, X_train, y_train, scaler, X_train.cpu().numpy(), TIME_STEPS)
     print(f"Initial Model Metrics -> MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, R²: {metrics['r2']:.4f}, Price MAE: ${metrics['price_mae']:.2f}")
     
     # Save initial model
+    log_model_mlflow(model, cycle_num=0, metrics=metrics, X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test, pred_scaled=y_pred)
     save_model(model, cycle_num=0)
 
     # --- DYNAMIC LOOP PHASE ---
@@ -209,10 +279,11 @@ def main():
                     train_model(model, X_new, y_new, criterion, optimizer, training_type="incremental")
                     
                     # Evaluate model after training
-                    metrics = evaluate_model(model, X_new, y_new, scaler, X_new.cpu().numpy(), TIME_STEPS)
+                    metrics, y_pred = evaluate_model(model, X_new, y_new, scaler, X_new.cpu().numpy(), TIME_STEPS)
                     print(f"Cycle {cycle_count} Metrics -> MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, R²: {metrics['r2']:.4f}, Price MAE: ${metrics['price_mae']:.2f}")
                     
                     # Save model after training
+                    log_model_mlflow(model, cycle_num=cycle_count, metrics=metrics, X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test, pred_scaled=y_pred)
                     save_model(model, cycle_num=cycle_count)
                     cycle_count += 1
 
