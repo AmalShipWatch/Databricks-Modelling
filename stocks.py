@@ -16,7 +16,7 @@ TICKER = "BTC-USD"
 INTERVAL = "1m"           # 1 Minute candles (Fastest available)
 TIME_STEPS = 15           # Look back 15 minutes
 TRAINING_INTERVAL = 60    # Wait 60s to ensure a new candle forms
-EPOCHS_PER_CYCLE = 20      # Quick update
+EPOCHS_PER_CYCLE = 100      # Quick update
 
 # Check for GPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -201,7 +201,7 @@ def main():
                     pbar = tqdm(range(EPOCHS_PER_CYCLE), desc="Incremental Training")
                     total_loss = 0
                     
-                    for epoch_idx in range(EPOCHS_PER_CYCLE):
+                    for epoch_idx in pbar:
                         optimizer.zero_grad()
                         outputs = model(X_new)
                         loss = criterion(outputs, y_new)
