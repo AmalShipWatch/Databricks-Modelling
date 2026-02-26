@@ -118,12 +118,33 @@ def save_model(model, cycle_num, models_dir="models"):
     # Ensure models directory exists
     if not os.path.exists(models_dir):
         os.makedirs(models_dir)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{models_dir}/model_cycle_{cycle_num}_{timestamp}.pth"
+    filename = f"{models_dir}/model_cycle_{cycle_num}.pth"
     
     torch.save(model.state_dict(), filename)
     print(f"Model saved: {filename}")
+
+def train_model(model, X_data, y_data, criterion, optimizer, training_type="initial"):
+    """
+    Unified training function for both initial and incremental training.
+    training_type: "initial" or "incremental"
+    """
+    model.train()
+    desc = "Initial Training" if training_type == "initial" else "Incremental Training"
+    pbar = tqdm(range(EPOCHS_PER_CYCLE), desc=desc)
+    total_loss = 0
+    
+    for epoch in pbar:
+        optimizer.zero_grad()
+        outputs = model(X_data)
+        loss = criterion(outputs, y_data)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        avg_loss = total_loss / (epoch + 1)
+        pbar.set_postfix({"avg_loss": f"{avg_loss:.6f}"})
+    
+    print(f"{desc} Complete. Loss: {loss.item():.6f}")
+    return loss.item()
 
 # --- 4. MAIN EXECUTION LOOP ---
 
@@ -149,22 +170,10 @@ def main():
     print("Performing initial training...")
     X_train, y_train, scaler, _ = prepare_tensors(master_df, TIME_STEPS)
     
-    model.train()
-    pbar = tqdm(range(EPOCHS_PER_CYCLE), desc="Initial Training")
-    total_loss = 0
-    for epoch in pbar:
-        optimizer.zero_grad()
-        outputs = model(X_train)
-        loss = criterion(outputs, y_train)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-        avg_loss = total_loss / (epoch + 1)
-        pbar.set_postfix({"avg_loss": f"{avg_loss:.6f}"})
-    print(f"Initial Training Complete. Loss: {loss.item():.6f}")
+    train_model(model, X_train, y_train, criterion, optimizer, training_type="initial")
     
     # Evaluate initial model
-    metrics = evaluate_model(model, X_train, y_train, scaler, _, TIME_STEPS)
+    metrics = evaluate_model(model, X_train, y_train, scaler, X_train.cpu().numpy(), TIME_STEPS)
     print(f"Initial Model Metrics -> MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, R²: {metrics['r2']:.4f}, Price MAE: ${metrics['price_mae']:.2f}")
     
     # Save initial model
@@ -197,23 +206,10 @@ def main():
                     X_new, y_new, scaler, scaled_full = prepare_tensors(master_df, TIME_STEPS)
                     
                     # E. Incremental Training
-                    model.train()
-                    pbar = tqdm(range(EPOCHS_PER_CYCLE), desc="Incremental Training")
-                    total_loss = 0
-                    
-                    for epoch_idx in pbar:
-                        optimizer.zero_grad()
-                        outputs = model(X_new)
-                        loss = criterion(outputs, y_new)
-                        loss.backward()
-                        optimizer.step()
-                        total_loss += loss.item()
-                        avg_loss = total_loss / (epoch_idx + 1)
-                        pbar.set_postfix({"avg_loss": f"{avg_loss:.6f}"})
-                    print(f"Incremental Training Complete. Loss: {loss.item():.6f}")
+                    train_model(model, X_new, y_new, criterion, optimizer, training_type="incremental")
                     
                     # Evaluate model after training
-                    metrics = evaluate_model(model, X_new, y_new, scaler, scaled_full, TIME_STEPS)
+                    metrics = evaluate_model(model, X_new, y_new, scaler, X_new.cpu().numpy(), TIME_STEPS)
                     print(f"Cycle {cycle_count} Metrics -> MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, R²: {metrics['r2']:.4f}, Price MAE: ${metrics['price_mae']:.2f}")
                     
                     # Save model after training
