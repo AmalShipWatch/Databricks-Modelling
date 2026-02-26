@@ -12,6 +12,7 @@ from datetime import datetime
 from tqdm import tqdm
 import mlflow
 from mlflow import MlflowClient
+from mlflow.models import infer_signature
 
 # --- TUNED CONFIGURATION ---
 TICKER = "BTC-USD"
@@ -126,69 +127,73 @@ def save_model(model, cycle_num, models_dir="models"):
     torch.save(model.state_dict(), filename)
     print(f"Model saved: {filename}")
 
-def log_model_mlflow(model, cycle_num, metrics, X_train=None, y_train=None, X_test=None, y_test=None, pred_scaled=None):
+def log_model_mlflow(model, cycle_num, metrics, X_train=None, pred_scaled=None, best_price_mae=None):
     """
     Logs model and metrics to MLflow.
+    Updates 'best' alias only if current model has better (lower) price_mae.
+    Returns: updated best_price_mae value
     """
-    
-    evaluation_data = X_test.copy()
-
     mlflow.set_experiment('/Users/amalmuhammed6677@gmail.com/bitcoin_forecast')
     with mlflow.start_run() as run:
-        feature_map = {
-            name: param.detach().cpu().numpy()
-            for name, param in model.named_parameters()
-        }
-
-        signature = infer_signature(X_train, pred_scaled)
-        mlflow.log_params(feture_map)
-
+        # Log parameters
+        mlflow.log_params({
+            "cycle": cycle_num,
+            "epochs": EPOCHS_PER_CYCLE,
+            "time_steps": TIME_STEPS
+        })
+        
+        # Log metrics
+        mlflow.log_metrics({
+            "mse": metrics['mse'],
+            "mae": metrics['mae'],
+            "rmse": metrics['rmse'],
+            "r2": metrics['r2'],
+            "price_mae": metrics['price_mae']
+        })
+        
+        # Create signature for model input/output
+        X_train_np = X_train.cpu().numpy() if torch.is_tensor(X_train) else X_train
+        pred_scaled_np = pred_scaled.cpu().numpy() if torch.is_tensor(pred_scaled) else pred_scaled
+        signature = infer_signature(X_train_np, pred_scaled_np)
+        
+        # Log PyTorch model
         model_info = mlflow.pytorch.log_model(
             model,
             "bitcoin_model",
             signature=signature,
-            input_example=X_train,
-            registered_model_name="workspace.default.BitcoinForecast",
-            metadata={"cycle": cycle_num}
+            input_example=X_train_np[:1],
+            registered_model_name="workspace.default.BitcoinForecast"
         )
-        mlflow.log_metrics(metrics)
-
-        mlflow.log_model(
-            model,
-            name = "bitcoin_model",
-            input_example=X_train.iloc[[0]],
-            targets = ytest.iloc[[0]],
-            model_format="pth",
-            registered_model_name="workspace.default.BitcoinForecast",
-            metadata={"cycle": cycle_num}
-        )
-
-        mlflow.models.evaluate(
-            model_info.model_uri,
-            data = evaluation_data,
-            targets=y_test,
-            profile="regression",
-            model_type="regressor",
-            eval_name=f"cycle_{cycle_num}",
-            evaluator_config={"metric_prefix": "mlflow_evaluation_"},
-        )
-
+        
         print(f"Model logged: {model_info.model_uri}")
-        print(f"RMSE: {metrics{"rmse"}:.2f}")
-        print(f"Price MAE: {metrics{"price_mae"}:.2f}")
+        print(f"Cycle {cycle_num} - RMSE: {metrics['rmse']:.4f}, Price MAE: ${metrics['price_mae']:.2f}")
+        
+        # Update best model alias if this is the best so far
+        if best_price_mae is None or metrics['price_mae'] < best_price_mae:
+            client = MlflowClient()
+            try:
+                client.set_registered_model_alias("workspace.default.BitcoinForecast", "best", cycle_num)
+                print(f"✓ New best model! Price MAE: ${metrics['price_mae']:.2f}")
+                return metrics['price_mae']  # Return new best price_mae
+            except Exception as e:
+                print(f"Warning: Could not set alias: {e}")
+                return best_price_mae
+        else:
+            print(f"✓ Model logged (Not better than best: ${best_price_mae:.2f})")
+            return best_price_mae
 
-    client = MlflowClient()
-    client.set_registered_model_alias("BitcoinForecast", "best", cycle_num)
-
-def deployment_validation(X_train = None, X_test = None):
+def deployment_validation():
     """
-    Validates the model using the MLflow API.
+    Loads and validates the best model from MLflow.
     """
-    model_uri = "models:/workspace.default.BitcoinForecast@best"
-    mlflow.models.predict(model_uri, X_train, env_manager = "uv")
-
-    loaded_registered_model = mlflow.pyfunc.load_model(model_uri=model_uri)
-    loaded_registered_model.predict(X_train)
+    try:
+        model_uri = "models:/workspace.default.BitcoinForecast@best"
+        loaded_model = mlflow.pytorch.load_model(model_uri)
+        print(f"✓ Best model loaded successfully: {model_uri}")
+        return loaded_model
+    except Exception as e:
+        print(f"Error: Could not load best model: {e}")
+        return None
 
 
 
@@ -224,6 +229,10 @@ def main():
     model = BitcoinLSTM().to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
+    
+    # Track best model based on price_mae
+    best_price_mae = None
+    best_cycle = 0
 
     # 2. Cold Start
     print("Fetching initial history...")
@@ -245,8 +254,9 @@ def main():
     metrics, y_pred = evaluate_model(model, X_train, y_train, scaler, X_train.cpu().numpy(), TIME_STEPS)
     print(f"Initial Model Metrics -> MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, R²: {metrics['r2']:.4f}, Price MAE: ${metrics['price_mae']:.2f}")
     
-    # Save initial model
-    log_model_mlflow(model, cycle_num=0, metrics=metrics, X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test, pred_scaled=y_pred)
+    # Save initial model and track best
+    best_price_mae = log_model_mlflow(model, cycle_num=0, metrics=metrics, X_train=X_train, pred_scaled=y_pred, best_price_mae=best_price_mae)
+    best_cycle = 0
     save_model(model, cycle_num=0)
 
     # --- DYNAMIC LOOP PHASE ---
@@ -254,7 +264,7 @@ def main():
     
     cycle_count = 1
     try:
-        while True:
+        while cycle_count <= 5:  # Limit to 5 cycles for testing
             # Wait for the next candle
             time.sleep(TRAINING_INTERVAL)
             
@@ -282,8 +292,10 @@ def main():
                     metrics, y_pred = evaluate_model(model, X_new, y_new, scaler, X_new.cpu().numpy(), TIME_STEPS)
                     print(f"Cycle {cycle_count} Metrics -> MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, R²: {metrics['r2']:.4f}, Price MAE: ${metrics['price_mae']:.2f}")
                     
-                    # Save model after training
-                    log_model_mlflow(model, cycle_num=cycle_count, metrics=metrics, X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test, pred_scaled=y_pred)
+                    # Save model and update best model tracking
+                    best_price_mae = log_model_mlflow(model, cycle_num=cycle_count, metrics=metrics, X_train=X_new, pred_scaled=y_pred, best_price_mae=best_price_mae)
+                    if best_price_mae == metrics['price_mae']:
+                        best_cycle = cycle_count
                     save_model(model, cycle_num=cycle_count)
                     cycle_count += 1
 

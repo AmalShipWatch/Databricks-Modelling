@@ -6,3 +6,4 @@ tqdm
 yfinance
 torch
 torchvision
+mlflow
