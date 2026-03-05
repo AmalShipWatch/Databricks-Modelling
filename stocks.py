@@ -185,8 +185,6 @@ def deployment_validation():
         print(f"Error: Could not load best model: {e}")
         return None
 
-
-
 def train_model(model, X_data, y_data, criterion, optimizer, training_type="initial"):
     """
     Unified training function for both initial and incremental training.
@@ -194,10 +192,10 @@ def train_model(model, X_data, y_data, criterion, optimizer, training_type="init
     """
     model.train()
     desc = "Initial Training" if training_type == "initial" else "Incremental Training"
-    pbar = tqdm(range(EPOCHS_PER_CYCLE), desc=desc)
+    # pbar = tqdm(range(EPOCHS_PER_CYCLE), desc=desc)
     total_loss = 0
     
-    for epoch in pbar:
+    for epoch in range(EPOCHS_PER_CYCLE):
         optimizer.zero_grad()
         outputs = model(X_data)
         loss = criterion(outputs, y_data)
@@ -205,7 +203,7 @@ def train_model(model, X_data, y_data, criterion, optimizer, training_type="init
         optimizer.step()
         total_loss += loss.item()
         avg_loss = total_loss / (epoch + 1)
-        pbar.set_postfix({"avg_loss": f"{avg_loss:.6f}"})
+        # pbar.set_postfix({"avg_loss": f"{avg_loss:.6f}"})
     
     print(f"{desc} Complete. Loss: {loss.item():.6f}")
     return loss.item()
@@ -227,7 +225,7 @@ def main():
 
     # 2. Cold Start
     print("Fetching initial history...")
-    master_df = fetch_data(period="60d") # Will auto-adjust to 5d for 1m interval
+    master_df = fetch_data(period="5d") # Will auto-adjust to 5d for 1m interval
     
     if master_df is None or len(master_df) < TIME_STEPS:
         print("Not enough initial data. Exiting.")
