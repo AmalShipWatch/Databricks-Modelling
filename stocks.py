@@ -1,4 +1,6 @@
+
 import yfinance as yf
+
 import numpy as np
 import pandas as pd
 import torch
@@ -24,6 +26,9 @@ EPOCHS_PER_CYCLE = 100      # Quick update
 # Check for GPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Running on: {device}")
+
+# Configure MLflow to use Databricks Unity Catalog
+mlflow.set_registry_uri("databricks-uc")
 
 # --- 1. DATA FUNCTIONS ---
 
@@ -127,60 +132,45 @@ def save_model(model, cycle_num, models_dir="models"):
     torch.save(model.state_dict(), filename)
     print(f"Model saved: {filename}")
 
-def log_model_mlflow(model, cycle_num, metrics, X_train=None, pred_scaled=None, best_price_mae=None):
+def log_model_mlflow(model, cycle_num, metrics, X_train=None, y_train=None, pred_scaled=None):
     """
-    Logs model and metrics to MLflow.
-    Updates 'best' alias only if current model has better (lower) price_mae.
-    Returns: updated best_price_mae value
+    Logs model, metrics, and parameters to MLflow within a nested run context.
+    Called from within a nested run (mlflow.start_run(nested=True))
     """
-    mlflow.set_experiment('/Users/amalmuhammed6677@gmail.com/bitcoin_forecast')
-    with mlflow.start_run() as run:
-        # Log parameters
-        mlflow.log_params({
-            "cycle": cycle_num,
-            "epochs": EPOCHS_PER_CYCLE,
-            "time_steps": TIME_STEPS
-        })
-        
-        # Log metrics
-        mlflow.log_metrics({
-            "mse": metrics['mse'],
-            "mae": metrics['mae'],
-            "rmse": metrics['rmse'],
-            "r2": metrics['r2'],
-            "price_mae": metrics['price_mae']
-        })
-        
-        # Create signature for model input/output
-        X_train_np = X_train.cpu().numpy() if torch.is_tensor(X_train) else X_train
-        pred_scaled_np = pred_scaled.cpu().numpy() if torch.is_tensor(pred_scaled) else pred_scaled
-        signature = infer_signature(X_train_np, pred_scaled_np)
-        
-        # Log PyTorch model
-        model_info = mlflow.pytorch.log_model(
-            model,
-            "bitcoin_model",
-            signature=signature,
-            input_example=X_train_np[:1],
-            registered_model_name="workspace.default.BitcoinForecast"
-        )
-        
-        print(f"Model logged: {model_info.model_uri}")
-        print(f"Cycle {cycle_num} - RMSE: {metrics['rmse']:.4f}, Price MAE: ${metrics['price_mae']:.2f}")
-        
-        # Update best model alias if this is the best so far
-        if best_price_mae is None or metrics['price_mae'] < best_price_mae:
-            client = MlflowClient()
-            try:
-                client.set_registered_model_alias("workspace.default.BitcoinForecast", "best", cycle_num)
-                print(f"✓ New best model! Price MAE: ${metrics['price_mae']:.2f}")
-                return metrics['price_mae']  # Return new best price_mae
-            except Exception as e:
-                print(f"Warning: Could not set alias: {e}")
-                return best_price_mae
-        else:
-            print(f"✓ Model logged (Not better than best: ${best_price_mae:.2f})")
-            return best_price_mae
+    # ===== 1. LOG PARAMETERS =====
+    mlflow.log_params({
+        "cycle": cycle_num,
+        "epochs": EPOCHS_PER_CYCLE,
+        "time_steps": TIME_STEPS,
+        "ticker": TICKER,
+        "interval": INTERVAL,
+        "training_interval": TRAINING_INTERVAL
+    })
+    
+    # ===== 2. LOG METRICS =====
+    mlflow.log_metrics({
+        "mse": metrics['mse'],
+        "mae": metrics['mae'],
+        "rmse": metrics['rmse'],
+        "r2": metrics['r2'],
+        "price_mae": metrics['price_mae']
+    })
+    
+    # ===== 3. CREATE PROPER SIGNATURE =====
+    X_train_np = X_train.cpu().numpy() if torch.is_tensor(X_train) else X_train
+    pred_scaled_np = pred_scaled.cpu().numpy() if torch.is_tensor(pred_scaled) else pred_scaled
+    signature = infer_signature(X_train_np, pred_scaled_np)
+    
+    # ===== 4. LOG PYTORCH MODEL =====
+    model_info = mlflow.pytorch.log_model(
+        model,
+        "bitcoin_model",
+        signature=signature,
+        input_example=X_train_np[:1],
+        registered_model_name="workspace.default.BitcoinForecast"
+    )
+    
+    print(f"  Cycle {cycle_num} logged: RMSE={metrics['rmse']:.4f}, Price MAE=${metrics['price_mae']:.2f}, R²={metrics['r2']:.6f}")
 
 def deployment_validation():
     """
@@ -233,6 +223,7 @@ def main():
     # Track best model based on price_mae
     best_price_mae = None
     best_cycle = 0
+    best_metrics = {}
 
     # 2. Cold Start
     print("Fetching initial history...")
@@ -244,77 +235,125 @@ def main():
 
     print(f"Initial data loaded. Total rows: {len(master_df)}")
 
-    # 3. Initial Training
-    print("Performing initial training...")
-    X_train, y_train, scaler, _ = prepare_tensors(master_df, TIME_STEPS)
-    
-    train_model(model, X_train, y_train, criterion, optimizer, training_type="initial")
-    
-    # Evaluate initial model
-    metrics, y_pred = evaluate_model(model, X_train, y_train, scaler, X_train.cpu().numpy(), TIME_STEPS)
-    print(f"Initial Model Metrics -> MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, R²: {metrics['r2']:.4f}, Price MAE: ${metrics['price_mae']:.2f}")
-    
-    # Save initial model and track best
-    best_price_mae = log_model_mlflow(model, cycle_num=0, metrics=metrics, X_train=X_train, pred_scaled=y_pred, best_price_mae=best_price_mae)
-    best_cycle = 0
-    save_model(model, cycle_num=0)
-
-    # --- DYNAMIC LOOP PHASE ---
-    print(f"\n--- ENTERING LIVE LOOP (Updates every {TRAINING_INTERVAL}s) ---")
-    
-    cycle_count = 1
-    try:
-        while cycle_count <= 5:  # Limit to 5 cycles for testing
-            # Wait for the next candle
-            time.sleep(TRAINING_INTERVAL)
+    # ===== PARENT RUN - BITCOIN TRAINING SESSION =====
+    mlflow.set_experiment('/Users/amalmuhammed6677@gmail.com/bitcoin_forecast')
+    with mlflow.start_run() as parent_run:
+        print(f"\nParent MLflow Run: {parent_run.info.run_id}")
+        
+        # 3. Initial Training
+        print("\nPerforming initial training...")
+        X_train, y_train, scaler, _ = prepare_tensors(master_df, TIME_STEPS)
+        
+        train_model(model, X_train, y_train, criterion, optimizer, training_type="initial")
+        
+        # Evaluate initial model
+        metrics, y_pred = evaluate_model(model, X_train, y_train, scaler, X_train.cpu().numpy(), TIME_STEPS)
+        print(f"Initial Model Metrics -> MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, R²: {metrics['r2']:.4f}, Price MAE: ${metrics['price_mae']:.2f}")
+        
+        # ===== NESTED RUN - CYCLE 0 =====
+        with mlflow.start_run(nested=True) as cycle_run:
+            log_model_mlflow(model, cycle_num=0, metrics=metrics, X_train=X_train, y_train=y_train, pred_scaled=y_pred)
             
-            # A. Fetch small batch (Last 1 day is enough to catch new minutes)
-            new_df = fetch_data(period="1d")
-            
-            if new_df is not None:
-                # B. Logic: Find rows in new_df that are NEWER than master_df
-                last_saved_time = master_df.index[-1]
-                new_rows = new_df[new_df.index > last_saved_time]
+            # Track as best model
+            if best_price_mae is None or metrics['price_mae'] < best_price_mae:
+                best_price_mae = metrics['price_mae']
+                best_cycle = 0
+                best_metrics = metrics.copy()
+                print(f"✓ Cycle 0 is now BEST model! Price MAE: ${metrics['price_mae']:.2f}\n")
+        
+        save_model(model, cycle_num=0)
 
-                if not new_rows.empty:
-                    # C. Update Master Data
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] NEW CANDLE! Added {len(new_rows)} row(s).")
-                    master_df = pd.concat([master_df, new_rows])
-                    print(f"Total rows after Update: {len(master_df)}")
-                    
-                    # D. Re-Process
-                    X_new, y_new, scaler, scaled_full = prepare_tensors(master_df, TIME_STEPS)
-                    
-                    # E. Incremental Training
-                    train_model(model, X_new, y_new, criterion, optimizer, training_type="incremental")
-                    
-                    # Evaluate model after training
-                    metrics, y_pred = evaluate_model(model, X_new, y_new, scaler, X_new.cpu().numpy(), TIME_STEPS)
-                    print(f"Cycle {cycle_count} Metrics -> MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, R²: {metrics['r2']:.4f}, Price MAE: ${metrics['price_mae']:.2f}")
-                    
-                    # Save model and update best model tracking
-                    best_price_mae = log_model_mlflow(model, cycle_num=cycle_count, metrics=metrics, X_train=X_new, pred_scaled=y_pred, best_price_mae=best_price_mae)
-                    if best_price_mae == metrics['price_mae']:
-                        best_cycle = cycle_count
-                    save_model(model, cycle_num=cycle_count)
-                    cycle_count += 1
-
-                    # F. Prediction
-                    model.eval()
-                    with torch.no_grad():
-                        last_seq = torch.FloatTensor(scaled_full[-TIME_STEPS:]).unsqueeze(0).to(device)
-                        pred_scaled = model(last_seq).cpu().numpy()
-                        pred_price = scaler.inverse_transform(pred_scaled)[0][0]
-                        current_price = master_df['Close'].iloc[-1]
-                        
-                        print(f" -> Current: ${current_price:.2f}")
-                        print(f" -> Predicted Next 1m: ${pred_price:.2f}")
+        # --- DYNAMIC LOOP PHASE ---
+        print(f"--- ENTERING LIVE LOOP (Updates every {TRAINING_INTERVAL}s) ---")
+        
+        cycle_count = 1
+        try:
+            while cycle_count <= 5:  # Limit to 5 cycles for testing
+                # Wait for the next candle
+                time.sleep(TRAINING_INTERVAL)
                 
-                else:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] No new candle yet. (Yahoo updates every 60s)")
+                # A. Fetch small batch (Last 1 day is enough to catch new minutes)
+                new_df = fetch_data(period="1d")
+                
+                if new_df is not None:
+                    # B. Logic: Find rows in new_df that are NEWER than master_df
+                    last_saved_time = master_df.index[-1]
+                    new_rows = new_df[new_df.index > last_saved_time]
 
-    except KeyboardInterrupt:
-        print("\nStopped by user.")
+                    if not new_rows.empty:
+                        # C. Update Master Data
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] NEW CANDLE! Added {len(new_rows)} row(s).")
+                        master_df = pd.concat([master_df, new_rows])
+                        print(f"Total rows after Update: {len(master_df)}")
+                        
+                        # D. Re-Process
+                        X_new, y_new, scaler, scaled_full = prepare_tensors(master_df, TIME_STEPS)
+                        
+                        # E. Incremental Training
+                        train_model(model, X_new, y_new, criterion, optimizer, training_type="incremental")
+                        
+                        # Evaluate model after training
+                        metrics, y_pred = evaluate_model(model, X_new, y_new, scaler, X_new.cpu().numpy(), TIME_STEPS)
+                        print(f"Cycle {cycle_count} Metrics -> MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, R²: {metrics['r2']:.4f}, Price MAE: ${metrics['price_mae']:.2f}")
+                        
+                        # ===== NESTED RUN - CYCLE N =====
+                        with mlflow.start_run(nested=True):
+                            log_model_mlflow(model, cycle_num=cycle_count, metrics=metrics, X_train=X_new, y_train=y_new, pred_scaled=y_pred)
+                            
+                            # Track best model
+                            if metrics['price_mae'] < best_price_mae:
+                                best_price_mae = metrics['price_mae']
+                                best_cycle = cycle_count
+                                best_metrics = metrics.copy()
+                                print(f"✓ Cycle {cycle_count} is now BEST model! Price MAE: ${metrics['price_mae']:.2f}\n")
+                            else:
+                                print(f"✓ Model logged (Not better than best: ${best_price_mae:.2f})\n")
+                        
+                        save_model(model, cycle_num=cycle_count)
+                        cycle_count += 1
+
+                        # F. Prediction
+                        model.eval()
+                        with torch.no_grad():
+                            last_seq = torch.FloatTensor(scaled_full[-TIME_STEPS:]).unsqueeze(0).to(device)
+                            pred_scaled = model(last_seq).cpu().numpy()
+                            pred_price = scaler.inverse_transform(pred_scaled)[0][0]
+                            current_price = master_df['Close'].iloc[-1]
+                            
+                            print(f" -> Current: ${current_price:.2f}")
+                            print(f" -> Predicted Next 1m: ${pred_price:.2f}")
+                    
+                    else:
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] No new candle yet. (Yahoo updates every 60s)")
+
+        except KeyboardInterrupt:
+            print("\nStopped by user.")
+        
+        # ===== LOG BEST MODEL INFO AT PARENT LEVEL =====
+        print(f"\n{'='*60}")
+        print(f"TRAINING SESSION COMPLETE")
+        print(f"Best Model: Cycle {best_cycle}")
+        print(f"Best Price MAE: ${best_price_mae:.2f}")
+        print(f"Best RMSE: {best_metrics['rmse']:.4f}")
+        print(f"Best R²: {best_metrics['r2']:.6f}")
+        print(f"{'='*60}")
+        
+        # Log best results at parent run level
+        mlflow.log_metric("best_price_mae", best_price_mae)
+        mlflow.log_metric("best_rmse", best_metrics['rmse'])
+        mlflow.log_metric("best_r2", best_metrics['r2'])
+        mlflow.log_params({
+            "best_cycle": best_cycle,
+            "total_cycles": cycle_count
+        })
+        
+        # Set best model alias
+        client = MlflowClient()
+        try:
+            client.set_registered_model_alias("workspace.default.BitcoinForecast", "best", best_cycle)
+            print(f"\n✓ Best model alias set to cycle {best_cycle}")
+        except Exception as e:
+            print(f"Warning: Could not set best model alias: {e}")
 
 if __name__ == "__main__":
     main()
