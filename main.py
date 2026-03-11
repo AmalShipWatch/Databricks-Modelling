@@ -2,9 +2,13 @@ import torch
 import torch.nn as nn
 import sqlite3
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_absolute_error
 import numpy as np
+import pickle
+import os
 from tqdm import tqdm
-from sklearn.metrics import r2_score
+import mlflow
+from mlflow.models import infer_signature
 
 # Set random seed for reproducibility
 torch.manual_seed(42)
@@ -126,34 +130,94 @@ def test_and_evaluate(model, X_test, y_test, target_scaler):
     return predictions_inv, mse, mape, r2, y_test_inv
 
 
-def plot_model_fitting(X_test, y_test_inv, predictions_inv, feature_scaler):
+def save_scaler(target_scaler, save_path="models/scaler.pkl"):
     """
-    Plots the model fitting using Plotly (original scale).
+    Saves the target scaler to a pickle file for later use in API serving.
     Args:
-        X_test: Test features (torch tensor, scaled)
-        y_test_inv: True targets (inverse transformed)
-        predictions_inv: Model predictions (inverse transformed)
-        feature_scaler: Fitted StandardScaler for feature
+        target_scaler: Fitted StandardScaler for target variable
+        save_path: Path to save the scaler pickle file
     """
-    import plotly.graph_objs as go
-    import plotly.io as pio
-    X_test_np = X_test.cpu().numpy().flatten().reshape(-1, 1)
-    X_test_inv = feature_scaler.inverse_transform(X_test_np).flatten()
-    y_test_inv = y_test_inv.flatten()
-    pred_inv = predictions_inv.flatten()
+    # Create models directory if it doesn't exist
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    
+    with open(save_path, 'wb') as f:
+        pickle.dump(target_scaler, f)
+    
+    print(f"✓ Scaler saved to {save_path}")
 
-    # Sort for line plot
-    sort_idx = X_test_inv.argsort()
-    X_sorted = X_test_inv[sort_idx]
-    pred_sorted = pred_inv[sort_idx]
 
-    trace_true = go.Scatter(x=X_test_inv, y=y_test_inv, mode='markers', name='True Values')
-    trace_pred = go.Scatter(x=X_sorted, y=pred_sorted, mode='lines', name='Predicted Values')
-    layout = go.Layout(title='Model Fitting: True vs Predicted',
-                      xaxis=dict(title='Feature (original scale)'),
-                      yaxis=dict(title='Target (original scale)'))
-    fig = go.Figure(data=[trace_true, trace_pred], layout=layout)
-    pio.show(fig)
+def log_model_mlflow(model, X_test_raw, y_test_inv, predictions_inv, target_scaler, 
+                     imo_value, feature_col, target_col, epochs=10000):
+    """
+    Logs model, metrics, and scaler artifacts to MLflow.
+    Args:
+        model: Trained SimpleNN model
+        X_test_raw: Raw test features (numpy array)
+        y_test_inv: Inverse-transformed actual test targets
+        predictions_inv: Inverse-transformed model predictions
+        target_scaler: Fitted StandardScaler for target variable
+        imo_value: Ship IMO value for tracking
+        feature_col: Feature column name
+        target_col: Target column name
+        epochs: Number of training epochs
+    """
+    try:
+        # Calculate metrics in original scale
+        mse = ((predictions_inv - y_test_inv) ** 2).mean()
+        mae = mean_absolute_error(y_test_inv, predictions_inv)
+        rmse = np.sqrt(mse)
+        r2 = r2_score(y_test_inv, predictions_inv)
+        consumption_tonne = mae  # MAE rescaled to original consumption units
+        
+        # ===== LOG PARAMETERS =====
+        mlflow.log_params({
+            "epochs": epochs,
+            "hidden_layers": 16,
+            "output_layer": 1,
+            "imo_value": imo_value,
+            "feature_col": feature_col,
+            "target_col": target_col
+        })
+        
+        # ===== LOG METRICS =====
+        mlflow.log_metrics({
+            "mse": mse,
+            "mae": mae,
+            "rmse": rmse,
+            "r2": r2,
+            "consumption_tonne": consumption_tonne
+        })
+        
+        # ===== SAVE SCALER AS ARTIFACT =====
+        scaler_path = "scaler.pkl"
+        with open(scaler_path, 'wb') as f:
+            pickle.dump(target_scaler, f)
+        mlflow.log_artifact(scaler_path)
+        os.remove(scaler_path)
+        
+        # ===== CREATE MODEL SIGNATURE =====
+        signature = infer_signature(X_test_raw, predictions_inv)
+        
+        # ===== LOG PYTORCH MODEL =====
+        model_info = mlflow.pytorch.log_model(
+            model,
+            "consumption_model",
+            signature=signature,
+            input_example=X_test_raw[:1],
+            registered_model_name="workspace.default.ConsumptionPrediction"
+        )
+        
+        print(f"\n{'='*60}")
+        print(f"✓ Model logged to MLflow")
+        print(f"  Metrics: MSE={mse:.6f}, MAE={mae:.6f}, RMSE={rmse:.6f}")
+        print(f"  R² Score: {r2:.6f}")
+        print(f"  Consumption MAE (tonnes): {consumption_tonne:.4f}")
+        print(f"✓ Model registered: workspace.default.ConsumptionPrediction")
+        print(f"{'='*60}\n")
+        
+    except Exception as e:
+        print(f"Warning: MLflow logging failed: {e}")
+        print("Training completed but metrics were not logged.")
 
 
 # Main workflow example
@@ -162,23 +226,48 @@ if __name__ == "__main__":
     imo_value = 9935301
     feature_col = "avg_speed_unscaled"
     target_col = "consumption_unscaled"
+    epochs = 10000
 
-    # Fetch data
-    df = fetch_data(imo_value)
+    # ===== SET MLFLOW EXPERIMENT =====
+    mlflow.set_experiment("ship_consumption_model")
+    
+    # ===== START MLFLOW RUN =====
+    with mlflow.start_run():
+        # Fetch data
+        df = fetch_data(imo_value)
 
-    # Preprocess and split
-    X_train, y_train, X_test, y_test, feature_scaler, target_scaler = preprocess_and_split(df, feature_col, target_col)
+        # Preprocess and split
+        X_train, y_train, X_test, y_test, feature_scaler, target_scaler = preprocess_and_split(df, feature_col, target_col)
+        
+        # Get raw test data before torch conversion (for MLflow signature)
+        pandas_df = df.select(feature_col, target_col).toPandas()
+        X_raw = pandas_df[feature_col].values.reshape(-1, 1)
+        test_size = int(len(X_raw) * 0.2)
+        X_test_raw = X_raw[-test_size:]  # Get test portion in raw form
 
-    # Initialize and train model
-    model = SimpleNN()
-    model, loss_history = train_model(model, X_train, y_train, epochs=10000, lr=0.001)
+        # Initialize and train model
+        model = SimpleNN()
+        model, loss_history = train_model(model, X_train, y_train, epochs=epochs, lr=0.001)
 
-    # Test and evaluate
-    predictions_inv, mse, mape, r2, y_test_inv = test_and_evaluate(model, X_test, y_test, target_scaler)
-    print(f"Test MSE (original scale): {mse}")
-    print(f"Test MAPE (original scale): {mape:.2f}%")
-    print(f"Test R² score (original scale): {r2:.4f}")
-
-    # Plot model fitting
-    plot_model_fitting(X_test, y_test_inv, predictions_inv, feature_scaler)
-
+        # Test and evaluate
+        predictions_inv, mse, mape, r2, y_test_inv = test_and_evaluate(model, X_test, y_test, target_scaler)
+        print(f"\nTest Metrics (original scale):")
+        print(f"  MSE: {mse}")
+        print(f"  MAPE: {mape:.2f}%")
+        print(f"  R² score: {r2:.4f}")
+        
+        # Save scaler locally for API serving
+        save_scaler(target_scaler, save_path="models/scaler.pkl")
+        
+        # Log model and metrics to MLflow
+        log_model_mlflow(
+            model=model,
+            X_test_raw=X_test_raw,
+            y_test_inv=y_test_inv,
+            predictions_inv=predictions_inv,
+            target_scaler=target_scaler,
+            imo_value=imo_value,
+            feature_col=feature_col,
+            target_col=target_col,
+            epochs=epochs
+        )
