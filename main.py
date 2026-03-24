@@ -15,9 +15,9 @@ torch.manual_seed(42)
 np.random.seed(42)
 
 class SimpleNN(nn.Module):
-    def __init__(self):
+    def __init__(self, input_size=2):
         super(SimpleNN, self).__init__()
-        self.layer1 = nn.Linear(1, 16)
+        self.layer1 = nn.Linear(input_size, 16)
         self.layer2 = nn.Linear(16, 16)
         self.output = nn.Linear(16, 1)
         self.relu = nn.ReLU()
@@ -31,7 +31,7 @@ class SimpleNN(nn.Module):
 def fetch_data(imo_value):
     db_path = "/Volumes/workspace/digital_twin/digital-twin/digital_twin.db"
     conn = sqlite3.connect(db_path)
-    query = f"SELECT * FROM preprocessed_noon_data WHERE imo_value = {imo_value}"
+    query = f"SELECT * FROM preprocessed_sensor_data WHERE imo_value = {imo_value}"
     result = conn.execute(query).fetchall()
     columns = [desc[0] for desc in conn.execute(query).description]  # <-- Add this line
     from pyspark.sql.types import StructType, StructField, StringType
@@ -45,20 +45,24 @@ def fetch_data(imo_value):
     return tables_df
 
 
-def preprocess_and_split(df, feature_col, target_col, test_ratio=0.2):
+def preprocess_and_split(df, feature_cols, target_col, test_ratio=0.2):
     """
     Preprocesses the DataFrame, applies Standard scaling, and splits it into training and testing sets.
     Args:
         df: Spark DataFrame
-        feature_col: Name of the feature column
+        feature_cols: List of feature column names (e.g., ["avg_speed_unscaled", "mean_draft_unscaled"])
         target_col: Name of the target column
         test_ratio: Fraction of data to use for testing
     Returns:
         X_train, y_train, X_test, y_test (all torch tensors, scaled)
         feature_scaler, target_scaler (fitted scalers)
     """
-    pandas_df = df.select(feature_col, target_col).toPandas()
-    X = pandas_df[feature_col].values.reshape(-1, 1)
+    # Handle single string or list of columns
+    if isinstance(feature_cols, str):
+        feature_cols = [feature_cols]
+    
+    pandas_df = df.select(feature_cols + [target_col]).toPandas()
+    X = pandas_df[feature_cols].values  # Shape: (n_samples, n_features)
     y = pandas_df[target_col].values.reshape(-1, 1)
 
     # Shuffle and split
@@ -87,10 +91,33 @@ def preprocess_and_split(df, feature_col, target_col, test_ratio=0.2):
     return X_train, y_train, X_test, y_test, feature_scaler, target_scaler
 
 
-def train_model(model, X_train, y_train, epochs=10000, lr=0.001):
+def train_model(model, X_train, y_train, X_val=None, y_val=None, epochs=10000, lr=0.001, patience=500):
+    """
+    Train model with optional early stopping.
+    
+    Args:
+        model: Neural network model
+        X_train: Training features
+        y_train: Training targets
+        X_val: Validation features (for early stopping)
+        y_val: Validation targets (for early stopping)
+        epochs: Maximum number of epochs
+        lr: Learning rate
+        patience: Number of epochs with no improvement before stopping (default 500)
+    
+    Returns:
+        model: Trained model
+        loss_history: List of training losses
+        best_epoch: Epoch with best validation loss (if early stopping used)
+    """
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_history = []
+    val_loss_history = []
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    best_epoch = 0
+    
     for epoch in tqdm(range(epochs), desc="Training Epochs"):
         model.train()
         optimizer.zero_grad()
@@ -99,7 +126,30 @@ def train_model(model, X_train, y_train, epochs=10000, lr=0.001):
         loss.backward()
         optimizer.step()
         loss_history.append(loss.item())
-    return model, loss_history
+        
+        # Early stopping: evaluate on validation set
+        if X_val is not None and y_val is not None:
+            model.eval()
+            with torch.no_grad():
+                val_outputs = model(X_val)
+                val_loss = criterion(val_outputs, y_val)
+                val_loss_history.append(val_loss.item())
+            
+            # Check if validation loss improved
+            if val_loss.item() < best_val_loss:
+                best_val_loss = val_loss.item()
+                epochs_no_improve = 0
+                best_epoch = epoch
+            else:
+                epochs_no_improve += 1
+            
+            # Early stopping condition
+            if epochs_no_improve >= patience:
+                print(f"\n✓ Early stopping at epoch {epoch} (Best epoch: {best_epoch}, Patience: {patience})")
+                print(f"  Best validation loss: {best_val_loss:.6f}")
+                break
+    
+    return model, loss_history, best_epoch
 
 
 def test_and_evaluate(model, X_test, y_test, target_scaler):
@@ -221,6 +271,7 @@ def log_model_mlflow(model, X_test_raw, y_test_inv, predictions_inv, target_scal
         mae = mean_absolute_error(y_test_inv, predictions_inv)
         rmse = np.sqrt(mse)
         r2 = r2_score(y_test_inv, predictions_inv)
+        mape = np.mean(np.abs((y_test_inv - predictions_inv) / y_test_inv)) * 100
         consumption_tonne = mae  # MAE rescaled to original consumption units
         
         # ===== LOG PARAMETERS =====
@@ -236,6 +287,7 @@ def log_model_mlflow(model, X_test_raw, y_test_inv, predictions_inv, target_scal
         # ===== LOG METRICS =====
         mlflow.log_metrics({
             "mse": mse,
+            "mape": mape,
             "mae": mae,
             "rmse": rmse,
             "r2": r2,
@@ -302,8 +354,9 @@ def log_model_mlflow(model, X_test_raw, y_test_inv, predictions_inv, target_scal
 # Main workflow example
 if __name__ == "__main__":
     # Example values (replace with actual column names and IMO value)
-    imo_value = 9935301
-    feature_col = "avg_speed_unscaled"
+    imo_value = 9853228
+    feature_col1 = "avg_speed_unscaled"
+    feature_col2 = "mean_draft_unscaled"
     target_col = "consumption_unscaled"
     epochs = 10000
 
@@ -316,17 +369,30 @@ if __name__ == "__main__":
         df = fetch_data(imo_value)
 
         # Preprocess and split
-        X_train, y_train, X_test, y_test, feature_scaler, target_scaler = preprocess_and_split(df, feature_col, target_col)
+        X_train, y_train, X_test, y_test, feature_scaler, target_scaler = preprocess_and_split(
+            df, 
+            [feature_col1, feature_col2],  # Pass both features as list
+            target_col
+        )
         
         # Get raw test data before torch conversion (for MLflow signature)
-        pandas_df = df.select(feature_col, target_col).toPandas()
-        X_raw = pandas_df[feature_col].values.reshape(-1, 1)
+        pandas_df = df.select([feature_col1, feature_col2, target_col]).toPandas()
+        X_raw = pandas_df[[feature_col1, feature_col2]].values  # Shape: (n_samples, 2)
         test_size = int(len(X_raw) * 0.2)
-        X_test_raw = X_raw[-test_size:].astype(np.float32)  # Convert to float32 for MLflow signature consistency
+        X_test_raw = X_raw[-test_size:].astype(np.float32)  # Convert to float32
 
-        # Initialize and train model
-        model = SimpleNN()
-        model, loss_history = train_model(model, X_train, y_train, epochs=epochs, lr=0.001)
+        # Initialize and train model with early stopping
+        model = SimpleNN(input_size=2)  # 2 input features
+        model, loss_history, best_epoch = train_model(
+            model, 
+            X_train, 
+            y_train,
+            X_val=X_test,
+            y_val=y_test,
+            epochs=epochs, 
+            lr=0.001,
+            patience=500  # Early stopping patience
+        )
 
         # Test and evaluate
         predictions_inv, mse, mape, r2, y_test_inv = test_and_evaluate(model, X_test, y_test, target_scaler)
@@ -347,7 +413,7 @@ if __name__ == "__main__":
             target_scaler=target_scaler,
             feature_scaler=feature_scaler,
             imo_value=imo_value,
-            feature_col=feature_col,
+            feature_col=f"{feature_col1}, {feature_col2}",  # Log both feature names
             target_col=target_col,
             epochs=epochs
         )
