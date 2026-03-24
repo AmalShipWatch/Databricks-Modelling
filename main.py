@@ -229,7 +229,7 @@ if __name__ == "__main__":
     epochs = 10000
 
     # ===== SET MLFLOW EXPERIMENT =====
-    mlflow.set_experiment("ship_consumption_model")
+    mlflow.set_experiment("/Users/amalmuhammed6677@gmail.com/ship_consumption_model")
     
     # ===== START MLFLOW RUN =====
     with mlflow.start_run():
@@ -243,7 +243,7 @@ if __name__ == "__main__":
         pandas_df = df.select(feature_col, target_col).toPandas()
         X_raw = pandas_df[feature_col].values.reshape(-1, 1)
         test_size = int(len(X_raw) * 0.2)
-        X_test_raw = X_raw[-test_size:]  # Get test portion in raw form
+        X_test_raw = X_raw[-test_size:].astype(np.float32)  # Convert to float32 for MLflow signature consistency
 
         # Initialize and train model
         model = SimpleNN()
