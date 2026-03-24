@@ -208,5 +208,6 @@ __marimo__/
 
 *.pth
 *.env
+*.db
 /models
 /API_endpoint.ipynb

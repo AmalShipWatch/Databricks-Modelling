@@ -146,16 +146,70 @@ def save_scaler(target_scaler, save_path="models/scaler.pkl"):
     print(f"✓ Scaler saved to {save_path}")
 
 
-def log_model_mlflow(model, X_test_raw, y_test_inv, predictions_inv, target_scaler, 
+class ConsumptionPredictor(mlflow.pyfunc.PythonModel):
+    """
+    MLflow PyFunc wrapper that handles scaling and inverse-scaling.
+    Ensures input → scale → model → inverse-scale → output
+    """
+    def load_context(self, context):
+        """
+        Load model and scalers from artifacts.
+        """
+        import torch
+        
+        # Load model state dict
+        self.model = SimpleNN()
+        model_state = torch.load(context.artifacts["pytorch_model"])
+        self.model.load_state_dict(model_state)
+        self.model.eval()
+        
+        # Load scalers
+        self.feature_scaler = pickle.load(open(context.artifacts["feature_scaler"], "rb"))
+        self.target_scaler = pickle.load(open(context.artifacts["target_scaler"], "rb"))
+    
+    def predict(self, context, model_input):
+        """
+        End-to-end prediction with proper scaling.
+        
+        Args:
+            model_input: numpy array of shape (n_samples, 1) - raw feature values
+            
+        Returns:
+            numpy array of predictions in original consumption units (tonnes)
+        """
+        import torch
+        
+        # Step 1: Scale input (features) - same as training
+        scaled_input = self.feature_scaler.transform(model_input)
+        
+        # Step 2: Run model inference
+        tensor_input = torch.FloatTensor(scaled_input)
+        with torch.no_grad():
+            scaled_output = self.model(tensor_input).numpy()
+        
+        # Step 3: Inverse transform output - convert back to real consumption values
+        real_output = self.target_scaler.inverse_transform(scaled_output)
+        
+        return real_output
+
+
+def log_model_mlflow(model, X_test_raw, y_test_inv, predictions_inv, target_scaler, feature_scaler,
                      imo_value, feature_col, target_col, epochs=10000):
     """
-    Logs model, metrics, and scaler artifacts to MLflow.
+    Logs model, metrics, and scaler artifacts to MLflow using PyFunc wrapper.
+    
+    PyFunc wrapper ensures:
+    1. Input is scaled (matches training)
+    2. Model runs inference
+    3. Output is inverse-transformed to real consumption tonnes
+    
     Args:
         model: Trained SimpleNN model
         X_test_raw: Raw test features (numpy array)
         y_test_inv: Inverse-transformed actual test targets
         predictions_inv: Inverse-transformed model predictions
         target_scaler: Fitted StandardScaler for target variable
+        feature_scaler: Fitted StandardScaler for feature variable
         imo_value: Ship IMO value for tracking
         feature_col: Feature column name
         target_col: Target column name
@@ -188,27 +242,50 @@ def log_model_mlflow(model, X_test_raw, y_test_inv, predictions_inv, target_scal
             "consumption_tonne": consumption_tonne
         })
         
-        # ===== SAVE SCALER AS ARTIFACT =====
-        scaler_path = "scaler.pkl"
-        with open(scaler_path, 'wb') as f:
+        # ===== SAVE ARTIFACTS FOR PYFUNC =====
+        # Save PyTorch model state dict
+        model_path = "pytorch_model.pth"
+        torch.save(model.state_dict(), model_path)
+        
+        # Save feature scaler
+        feature_scaler_path = "feature_scaler.pkl"
+        with open(feature_scaler_path, 'wb') as f:
+            pickle.dump(feature_scaler, f)
+        
+        # Save target scaler
+        target_scaler_path = "target_scaler.pkl"
+        with open(target_scaler_path, 'wb') as f:
             pickle.dump(target_scaler, f)
-        mlflow.log_artifact(scaler_path)
-        os.remove(scaler_path)
         
         # ===== CREATE MODEL SIGNATURE =====
+        # Signature uses RAW input (what user provides) and RAW output (what they get back)
         signature = infer_signature(X_test_raw, predictions_inv)
         
-        # ===== LOG PYTORCH MODEL =====
-        model_info = mlflow.pytorch.log_model(
-            model,
-            "consumption_model",
+        # ===== LOG PYFUNC MODEL WITH WRAPPER =====
+        # PyFunc wrapper will handle all scaling automatically
+        model_info = mlflow.pyfunc.log_model(
+            "consumption_predictor",
+            python_model=ConsumptionPredictor(),
+            artifacts={
+                "pytorch_model": model_path,
+                "feature_scaler": feature_scaler_path,
+                "target_scaler": target_scaler_path
+            },
             signature=signature,
             input_example=X_test_raw[:1],
             registered_model_name="workspace.default.ConsumptionPrediction"
         )
         
+        # Cleanup temporary files
+        os.remove(model_path)
+        os.remove(feature_scaler_path)
+        os.remove(target_scaler_path)
+        
         print(f"\n{'='*60}")
-        print(f"✓ Model logged to MLflow")
+        print(f"✓ Model logged to MLflow (PyFunc wrapper)")
+        print(f"  Input: Raw feature values (e.g., 14.169)")
+        print(f"  Processing: Auto-scales → Model → Auto-inverse-scales")
+        print(f"  Output: Real consumption tonnes")
         print(f"  Metrics: MSE={mse:.6f}, MAE={mae:.6f}, RMSE={rmse:.6f}")
         print(f"  R² Score: {r2:.6f}")
         print(f"  Consumption MAE (tonnes): {consumption_tonne:.4f}")
@@ -217,6 +294,8 @@ def log_model_mlflow(model, X_test_raw, y_test_inv, predictions_inv, target_scal
         
     except Exception as e:
         print(f"Warning: MLflow logging failed: {e}")
+        import traceback
+        traceback.print_exc()
         print("Training completed but metrics were not logged.")
 
 
@@ -266,6 +345,7 @@ if __name__ == "__main__":
             y_test_inv=y_test_inv,
             predictions_inv=predictions_inv,
             target_scaler=target_scaler,
+            feature_scaler=feature_scaler,
             imo_value=imo_value,
             feature_col=feature_col,
             target_col=target_col,
