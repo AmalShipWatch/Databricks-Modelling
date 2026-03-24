@@ -2,18 +2,27 @@ import streamlit as st
 import requests
 
 TOKEN = st.secrets["DATABRICKS_TOKEN"]
-URL = "https://dbc-f2ea18fc-2f89.cloud.databricks.com/serving-endpoints/vessel_consumption/invocations"
+URL = "https://dbc-f2ea18fc-2f89.cloud.databricks.com/serving-endpoints/predict_consumption/invocations"
 
 st.set_page_config(page_title="Vessel Fuel Predictor", page_icon="🚢")
-st.title("🚢 Vessel Fuel Consumption Predictor")
 
+# 👇 Hide Streamlit branding, menu, and GitHub link
+st.markdown("""
+    <style>
+        #MainMenu {visibility: hidden;}
+        header {visibility: hidden;}
+        footer {visibility: hidden;}
+    </style>
+""", unsafe_allow_html=True)
+
+st.title("🚢 Vessel Fuel Consumption Predictor")
 st.markdown("Enter vessel parameters below to get a predicted fuel consumption.")
 
-power = st.number_input("Power (kW)", min_value=0.0, max_value=17, value=14.17, step=0.01, format="%.2f")
+power = st.number_input("Power (kW)", min_value=0.0, value=14.17, format="%.4f")
 draft = st.number_input("Draft (m)", min_value=0.0, max_value=30.0, value=7.0, step=0.5, format="%.1f")
 
 if st.button("Predict"):
-    payload = {"inputs": [[power, draft]]}  # 👈 now passing both
+    payload = {"inputs": [[power, draft]]}
     headers = {
         "Authorization": f"Bearer {TOKEN}",
         "Content-Type": "application/json"
