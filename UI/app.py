@@ -117,14 +117,27 @@ st.markdown(f"""
         .stAlert {{
             border-radius: 8px !important;
         }}
+
+        .stAlert p {{
+            color: #d4f76a !important;
+            font-weight: 700 !important;
+            font-size: 1.05rem !important;
+            text-shadow: 0 0 8px rgba(255, 80, 80, 0.6) !important;
+        }}
+
+        /* ---- spinner ---- */
+        .stSpinner p {{
+            color: #ffffff !important;
+            font-weight: 600 !important;
+        }}
     </style>
 """, unsafe_allow_html=True)
 
 st.title("🚢 Consumption Predictor")
 st.markdown("<p style='color:#cdd6f4; text-align:center; margin-top:-12px; font-size:1.25rem;'>Enter vessel parameters to get a predicted fuel consumption</p>", unsafe_allow_html=True)
 
-power = st.number_input("Power (kW)", min_value=0.0, value=14.17, format="%.4f")
-draft = st.number_input("Draft (m)", min_value=0.0, max_value=30.0, value=7.0, step=0.5, format="%.1f")
+power = st.number_input("Power (kW)", min_value=0.0, format="%.2f")
+draft = st.number_input("Draft (m)", min_value=0.0, max_value=30.0, step=0.5, format="%.1f")
 
 if st.button("Predict"):
     payload = {"inputs": [[power, draft]]}
