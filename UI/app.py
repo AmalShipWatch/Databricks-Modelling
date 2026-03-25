@@ -4,7 +4,7 @@ import base64
 from pathlib import Path
 
 TOKEN = st.secrets["DATABRICKS_TOKEN"]
-URL = "https://dbc-f2ea18fc-2f89.cloud.databricks.com/serving-endpoints/vessel_consumption/invocations"
+URL = "https://dbc-f2ea18fc-2f89.cloud.databricks.com/serving-endpoints/predict_consumption/invocations"
 
 st.set_page_config(page_title="Vessel Fuel Predictor", page_icon="🚢", layout="centered")
 
@@ -13,7 +13,8 @@ def get_base64_image(image_path):
     with open(image_path, "rb") as f:
         return base64.b64encode(f.read()).decode()
 
-img_base64 = get_base64_image(".streamlit/static/shipwatch.jpg")
+img_path = Path(__file__).parent / ".streamlit" / "static" / "shipwatch.jpg"
+img_base64 = get_base64_image(img_path)
 
 st.markdown(f"""
     <style>
@@ -100,13 +101,18 @@ st.markdown(f"""
             color: #fcfcfc !important;
             border: 2px solid #80c41c !important;
         }}
-
-        /* ---- success / error boxes ---- */
+        /* ---- success box ---- */
         .stSuccess {{
-            background: #eaf6d5 !important;
-            color: #071447 !important;
+            background: rgba(128, 196, 28, 0.15) !important;
+            color: #80c41c !important;
             border-left: 4px solid #80c41c !important;
             border-radius: 8px !important;
+        }}
+
+        /* text inside success box */
+        .stSuccess p {{
+            color: #80c41c !important;
+            font-weight: 600 !important;
         }}
         .stAlert {{
             border-radius: 8px !important;
